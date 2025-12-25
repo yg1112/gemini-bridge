@@ -1,172 +1,139 @@
-console.log("🚀 Gemini Bridge Loaded");
+// 引用 content.js 覆盖
+console.log("🚀 Gemini Bridge Loaded - v2.0 Debug Mode");
 
-// 监听来自 Background 的消息
+// 视觉反馈辅助函数
+function setStatus(status) {
+    if (status === 'working') {
+        document.body.style.border = "5px solid red";
+    } else if (status === 'success') {
+        document.body.style.border = "5px solid green";
+        setTimeout(() => document.body.style.border = "none", 1000);
+    } else {
+        document.body.style.border = "none";
+    }
+}
+
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
-    console.log("📥 Received message from background:", request);
+    console.log("📥 Received prompt:", request);
     if (request.prompt) {
+        setStatus('working');
         runPrompt(request.id, request.prompt);
     }
-    return true; // 保持消息通道开放
+    return true;
 });
 
 async function runPrompt(id, text) {
-    console.log(`🎯 Running prompt (ID: ${id}):`, text.substring(0, 50) + "...");
+    // 1. 寻找输入框 (更新的选择器列表)
+    const selectors = [
+        'div[contenteditable="true"]',
+        'rich-textarea div p', // 新版 Gemini 常见
+        'textarea',
+        '[role="textbox"]'
+    ];
     
-    // 1. 找到输入框 (尝试多种选择器)
-    let inputArea = document.querySelector('div[contenteditable="true"]');
-    
-    // 如果找不到，尝试其他选择器
-    if (!inputArea) {
-        inputArea = document.querySelector('textarea[placeholder*="message"], textarea[aria-label*="message"]');
+    let inputArea = null;
+    for (const sel of selectors) {
+        inputArea = document.querySelector(sel);
+        if (inputArea) break;
     }
+
     if (!inputArea) {
-        inputArea = document.querySelector('[contenteditable="true"][role="textbox"]');
-    }
-    
-    if (!inputArea) {
-        console.error("❌ 找不到 Gemini 输入框！");
-        // 发送错误响应
-        chrome.runtime.sendMessage({
-            type: 'GEMINI_RESPONSE',
-            id: id,
-            content: "错误：找不到 Gemini 输入框，请确保你在聊天界面！"
-        });
+        console.error("❌ 找不到输入框");
+        chrome.runtime.sendMessage({ type: 'GEMINI_RESPONSE', id: id, content: "Error: Input box not found on page." });
+        setStatus('error');
         return;
     }
 
-    console.log("✅ 找到输入框");
-
-    // 2. 填入文本 (模拟用户输入)
+    // 2. 填入文本
     inputArea.focus();
+    document.execCommand('selectAll', false, null);
+    document.execCommand('insertText', false, text);
     
-    // 清空现有内容
-    inputArea.innerText = '';
-    inputArea.textContent = '';
+    // 3. 点击发送
+    await new Promise(r => setTimeout(r, 800)); // 稍等 UI 反应
     
-    // 使用多种方法填入文本
-    try {
-        document.execCommand('insertText', false, text);
-    } catch (e) {
-        // 如果 execCommand 失败，直接设置内容
-        inputArea.innerText = text;
-        inputArea.textContent = text;
-        
-        // 触发输入事件
-        const inputEvent = new Event('input', { bubbles: true });
-        inputArea.dispatchEvent(inputEvent);
+    const sendBtnSelectors = [
+        'button[aria-label*="Send"]',
+        'button[aria-label*="发送"]',
+        '.send-button', // 通用类名猜测
+        'button[data-testid="send-button"]'
+    ];
+    
+    let sendBtn = null;
+    for (const sel of sendBtnSelectors) {
+        sendBtn = document.querySelector(sel);
+        if (sendBtn) break;
     }
-
-    console.log("✅ 文本已填入");
-
-    // 3. 点击发送按钮 (尝试多种选择器)
-    await new Promise(r => setTimeout(r, 500)); // 等待 UI 响应
     
-    let sendBtn = document.querySelector('button[aria-label*="Send"], button[aria-label*="发送"]');
-    if (!sendBtn) {
-        sendBtn = document.querySelector('button[data-testid*="send"], button[type="submit"]');
-    }
-    if (!sendBtn) {
-        // 尝试通过键盘事件发送
-        console.log("⚠️ 找不到发送按钮，尝试模拟回车...");
+    if (sendBtn) {
+        sendBtn.click();
+    } else {
+        // 回退方案：回车键
         const enterEvent = new KeyboardEvent('keydown', {
-            key: 'Enter',
-            code: 'Enter',
-            keyCode: 13,
-            which: 13,
-            bubbles: true,
-            cancelable: true
+            bubbles: true, cancelable: true, keyCode: 13, key: 'Enter', code: 'Enter'
         });
         inputArea.dispatchEvent(enterEvent);
-    } else {
-        sendBtn.click();
-        console.log("✅ 已点击发送按钮");
     }
 
-    // 4. 监听回复生成
+    // 4. 等待响应
     waitForResponse(id);
 }
 
 function waitForResponse(id) {
-    console.log("⏳ Waiting for Gemini response (ID: " + id + ")...");
+    console.log("⏳ Waiting for response...");
     
-    // 获取当前已有的所有回答，用于对比
-    // 尝试多种选择器来找到响应容器
-    let existingResponses = document.querySelectorAll('model-response');
-    if (existingResponses.length === 0) {
-        existingResponses = document.querySelectorAll('[data-model-response], [class*="response"], [class*="message"]');
-    }
-    
-    const initialCount = existingResponses.length;
-    console.log(`📊 初始响应数量: ${initialCount}`);
-    
-    let debounceTimer = null;
-    let lastTextLength = 0;
+    let lastText = "";
     let stableCount = 0;
-    const maxStableChecks = 3; // 连续3次长度不变则认为完成
-
-    const observer = new MutationObserver((mutations) => {
-        // 尝试多种选择器
-        let responses = document.querySelectorAll('model-response');
-        if (responses.length === 0) {
-            responses = document.querySelectorAll('[data-model-response]');
-        }
-        if (responses.length === 0) {
-            // 尝试找到包含文本的响应区域
-            responses = document.querySelectorAll('[class*="response"] [class*="text"], [class*="message"] [class*="content"]');
-        }
-        
-        if (responses.length > initialCount) {
-            const lastResponse = responses[responses.length - 1];
-            const responseText = lastResponse.innerText || lastResponse.textContent || '';
-            const currentLength = responseText.length;
-            
-            console.log(`📝 检测到响应，当前长度: ${currentLength}`);
-            
-            if (currentLength > 0) {
-                // 检查文本长度是否稳定
-                if (currentLength === lastTextLength) {
-                    stableCount++;
-                    console.log(`📊 文本长度稳定 (${stableCount}/${maxStableChecks})`);
-                } else {
-                    stableCount = 0;
-                    lastTextLength = currentLength;
-                }
-                
-                // 如果文本长度稳定，或者超过一定长度，认为生成完成
-                if (stableCount >= maxStableChecks || currentLength > 1000) {
-                    // 防抖：再等2秒确保完全生成
-                    if (debounceTimer) clearTimeout(debounceTimer);
-                    debounceTimer = setTimeout(() => {
-                        observer.disconnect();
-                        console.log("✅ Response captured! 长度:", responseText.length);
-                        
-                        // 发送回 Background
-                        chrome.runtime.sendMessage({
-                            type: 'GEMINI_RESPONSE',
-                            id: id,
-                            content: responseText
-                        }).catch(err => {
-                            console.error("❌ Failed to send response:", err);
-                        });
-                    }, 2000);
-                }
-            }
-        }
-    });
-
-    observer.observe(document.body, { childList: true, subtree: true });
+    const maxStable = 5; // 连续 5 次检查文本没变，认为生成结束
+    const checkInterval = 1000; // 每秒检查一次
     
-    // 超时保护：120秒后强制返回
-    setTimeout(() => {
-        if (debounceTimer) {
-            clearTimeout(debounceTimer);
+    // 获取当前页面所有文本内容作为基准
+    // 注意：这里我们简化逻辑，获取页面上最后一条消息
+    const checkLoop = setInterval(() => {
+        // 尝试获取最新的回复容器
+        // Gemini 的回复通常在特定的 container 里，但直接抓取最后生成的文本更通用
+        const responses = document.querySelectorAll('.message-content, model-response, [data-message-id]');
+        
+        let currentText = "";
+        if (responses.length > 0) {
+            currentText = responses[responses.length - 1].innerText;
+        } else {
+            // 实在找不到特定类名，就抓取 main 区域的文本长度变化
+            const main = document.querySelector('main');
+            if (main) currentText = main.innerText;
         }
-        observer.disconnect();
-        console.warn("⏱️ 响应超时，返回空响应");
-        chrome.runtime.sendMessage({
-            type: 'GEMINI_RESPONSE',
-            id: id,
-            content: "错误：等待 Gemini 响应超时"
-        }).catch(err => console.error("❌ Failed to send timeout response:", err));
+
+        console.log(`Checking stability... Length: ${currentText.length}`);
+
+        if (currentText.length > lastText.length) {
+            // 还在生成中
+            lastText = currentText;
+            stableCount = 0;
+        } else if (currentText.length === lastText.length && currentText.length > 0) {
+            // 长度稳定
+            stableCount++;
+        }
+
+        // 如果稳定了 N 秒，且内容不为空 (或者超时 120s)
+        if (stableCount >= maxStable) {
+            clearInterval(checkLoop);
+            console.log("✅ Response captured!");
+            setStatus('success');
+            
+            // 提取真正的增量文本（如果是对话流，这里可能需要优化，目前先返回全部最后一轮）
+            chrome.runtime.sendMessage({
+                type: 'GEMINI_RESPONSE',
+                id: id,
+                content: lastText // 简单返回捕获到的文本
+            });
+        }
+    }, checkInterval);
+    
+    // 120秒硬超时
+    setTimeout(() => {
+        clearInterval(checkLoop);
+        if (stableCount < maxStable) {
+             chrome.runtime.sendMessage({ type: 'GEMINI_RESPONSE', id: id, content: "Error: Timeout waiting for DOM stability." });
+        }
     }, 120000);
 }

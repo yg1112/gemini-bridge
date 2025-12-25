@@ -56,18 +56,22 @@ async def chat_completions(request: Request):
     pending_responses[request_id] = future
 
     # 3. 通过 WebSocket 发给 Chrome
-    print(f"🟡 Forwarding to Gemini: {last_user_message[:50]}...")
-    await connected_client.send_text(json.dumps({
-        "id": request_id,
-        "prompt": last_user_message
-    }))
-
-    # 4. 阻塞等待 Chrome 返回 (超时设置为 120秒，因为 Gemini 生成慢)
+    print(f"🟡 [Proxy] Sending to Chrome: {last_user_message[:100]}...") # 增加日志
     try:
-        gemini_response = await asyncio.wait_for(future, timeout=120.0)
+        await connected_client.send_text(json.dumps({
+            "id": request_id,
+            "prompt": last_user_message
+        }))
+    except Exception as e:
+         return JSONResponse({"error": f"Failed to send to Chrome: {str(e)}"}, status_code=500)
+
+    # 4. 阻塞等待 (延长一点超时时间以防万一)
+    try:
+        gemini_response = await asyncio.wait_for(future, timeout=130.0)
     except asyncio.TimeoutError:
+        print(f"🔴 [Proxy] Timeout waiting for ID: {request_id}")
         del pending_responses[request_id]
-        return JSONResponse({"error": "Gemini timed out"}, status_code=504)
+        return JSONResponse({"error": "Gemini timed out - Check Chrome Console"}, status_code=504)
 
     # 5. 伪装成 OpenAI 格式返回给 Aider
     print(f"🟢 Received from Gemini: {len(gemini_response)} chars")
