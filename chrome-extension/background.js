@@ -27,6 +27,18 @@ function connect() {
         clearTimeout(reconnectTimer);
         reconnectTimer = null;
       }
+      
+      // 自动刷新 Gemini 页面，确保注入最新的 content script
+      chrome.tabs.query({url: 'https://gemini.google.com/*'}, (tabs) => {
+        if (tabs && tabs.length > 0) {
+          tabs.forEach(tab => {
+            console.log('🔄 Auto-refreshing Gemini tab:', tab.id);
+            chrome.tabs.reload(tab.id, {bypassCache: false});
+          });
+        } else {
+          console.log('💡 No Gemini tabs open - ready for manual navigation');
+        }
+      });
     };
     
     socket.onmessage = (event) => {

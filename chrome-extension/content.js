@@ -44,14 +44,13 @@ function simulateClick(element) {
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     console.log("📥 Received prompt:", request);
     if (request.prompt) {
-        // 立即确认收到，避免 message channel closed 错误
-        sendResponse({status: "processing"});
-        // 独立运行，不阻塞消息通道
+        // 立即同步回复，避免 message channel closed 错误
+        sendResponse({status: "received"});
+        // 异步执行，不阻塞消息通道
         setStatus('working');
         runPrompt(request.id, request.prompt);
     }
-    // 不返回 true，因为我们已经同步调用了 sendResponse
-    return false;
+    // 不返回 true，因为已经同步调用了 sendResponse
 });
 
 async function runPrompt(id, text) {
@@ -73,7 +72,7 @@ async function runPrompt(id, text) {
             break;
         }
     }
-
+    
     if (!inputArea) {
         console.error("❌ [runPrompt] 找不到输入框");
         chrome.runtime.sendMessage({ type: 'GEMINI_RESPONSE', id: id, content: "Error: Input box not found on page." });
@@ -84,92 +83,61 @@ async function runPrompt(id, text) {
     // 2. 填入文本
     console.log("📝 [runPrompt] Filling text...");
     inputArea.focus();
-    document.execCommand('selectAll', false, null);
-    document.execCommand('insertText', false, text);
+    
+    // 清空并填入新文本
+    if (inputArea.contentEditable === 'true') {
+        // contenteditable div
+    inputArea.innerText = '';
+        inputArea.focus();
+        document.execCommand('insertText', false, text);
+    } else {
+        // textarea
+        inputArea.value = text;
+    }
+    
+    // 触发 input 事件，激活 React 状态
+    const inputEvent = new Event('input', { bubbles: true, cancelable: true });
+    inputArea.dispatchEvent(inputEvent);
+    
     console.log("✅ [runPrompt] Text filled");
     
-    // 3. 点击发送（使用模拟点击）
-    await new Promise(r => setTimeout(r, 800)); // 稍等 UI 反应
+    // 3. 使用纯键盘方式发送（更可靠）
+    await new Promise(r => setTimeout(r, 100)); // 短暂等待 UI 反应
     
-    const sendBtnSelectors = [
-        'button[aria-label*="Send"]',
-        'button[aria-label*="发送"]',
-        '.send-button', // 通用类名猜测
-        'button[data-testid="send-button"]'
-    ];
+    console.log("🚀 [runPrompt] Sending with Enter key (primary method)");
     
-    let sendBtn = null;
-    for (const sel of sendBtnSelectors) {
-        sendBtn = document.querySelector(sel);
-        if (sendBtn) {
-            console.log(`✅ [runPrompt] Found send button with selector: ${sel}`);
-            break;
-        }
-    }
-    
-    let sendSuccess = false;
-    
-    if (sendBtn) {
-        console.log("🚀 [runPrompt] Attempting to send with button click");
-        simulateClick(sendBtn);
-        
-        // 验证发送是否成功（检查输入框是否清空）
-        await new Promise(r => setTimeout(r, 2000));
-        const currentText = inputArea.innerText || inputArea.textContent || inputArea.value || "";
-        
-        if (currentText.trim().length === 0) {
-            console.log("✅ [runPrompt] Send successful - input cleared");
-            sendSuccess = true;
-        } else {
-            console.warn("⚠️ [runPrompt] Send may have failed - input still has text, trying Enter key");
-            // 尝试回车键
-            const enterEvent = new KeyboardEvent('keydown', {
-                bubbles: true, 
-                cancelable: true, 
-                keyCode: 13, 
-                key: 'Enter', 
-                code: 'Enter',
-                which: 13
-            });
-            inputArea.dispatchEvent(enterEvent);
-            
-            await new Promise(r => setTimeout(r, 1000));
-            const finalText = inputArea.innerText || inputArea.textContent || inputArea.value || "";
-            sendSuccess = finalText.trim().length === 0;
-            
-            if (sendSuccess) {
-                console.log("✅ [runPrompt] Send successful with Enter key");
-            } else {
-                console.error("❌ [runPrompt] Send failed - text still in input box");
-            }
-        }
-    } else {
-        console.log("⚠️ [runPrompt] No send button found, using Enter key");
-        // 回退方案：回车键
-        const enterEvent = new KeyboardEvent('keydown', {
-            bubbles: true, 
-            cancelable: true, 
-            keyCode: 13, 
-            key: 'Enter', 
+    // 发送完整的键盘事件序列
+    const sendEnter = () => {
+        const eventOptions = {
+            bubbles: true,
+            cancelable: true,
+            key: 'Enter',
             code: 'Enter',
-            which: 13
-        });
-        inputArea.dispatchEvent(enterEvent);
+            keyCode: 13,
+            which: 13,
+            view: window
+        };
         
-        await new Promise(r => setTimeout(r, 1000));
-        const finalText = inputArea.innerText || inputArea.textContent || inputArea.value || "";
-        sendSuccess = finalText.trim().length === 0;
-    }
-
-    if (!sendSuccess) {
-        console.error("❌ [runPrompt] Failed to send message");
-        chrome.runtime.sendMessage({ 
-            type: 'GEMINI_RESPONSE', 
-            id: id, 
-            content: "Error: Failed to send message to Gemini. Input box did not clear." 
-        });
-        setStatus('error');
-        return;
+        inputArea.dispatchEvent(new KeyboardEvent('keydown', eventOptions));
+        inputArea.dispatchEvent(new KeyboardEvent('keypress', eventOptions));
+        inputArea.dispatchEvent(new KeyboardEvent('keyup', eventOptions));
+    };
+    
+    // 连续发送两次 Enter，确保 React 捕捉到
+    sendEnter();
+    await new Promise(r => setTimeout(r, 50));
+    sendEnter();
+    
+    // 验证发送是否成功（检查输入框是否清空）
+    await new Promise(r => setTimeout(r, 1500));
+    const currentText = inputArea.innerText || inputArea.textContent || inputArea.value || "";
+    const sendSuccess = currentText.trim().length === 0;
+    
+    if (sendSuccess) {
+        console.log("✅ [runPrompt] Send successful - input cleared");
+    } else {
+        console.warn("⚠️ [runPrompt] Input not cleared, text still present:", currentText.substring(0, 50));
+        // 可能仍在发送中，继续等待响应检测
     }
 
     // 4. 等待响应
@@ -291,7 +259,7 @@ function waitForResponse(id, userPrompt = "") {
             if (responseText && responseText.length > 0) {
                 finalText = responseText;
                 console.log("📝 [waitForResponse] Using responseText, length:", finalText.length);
-            } else {
+                } else {
                 // 方法2: 查找对话区域中的最后一条消息（排除用户消息）
                 const chatMessages = document.querySelectorAll('[class*="message"], [data-message-id], [class*="conversation"] [class*="item"]');
                 if (chatMessages.length > 0) {
@@ -405,9 +373,9 @@ function waitForResponse(id, userPrompt = "") {
                 }
             } else {
                 // 没有检测到任何内容生成，返回错误
-                chrome.runtime.sendMessage({ 
-                    type: 'GEMINI_RESPONSE', 
-                    id: id, 
+        chrome.runtime.sendMessage({
+            type: 'GEMINI_RESPONSE',
+            id: id,
                     content: "Error: Timeout waiting for DOM stability." 
                 }).catch(err => {
                     console.error("❌ [waitForResponse] Failed to send timeout response:", err);
