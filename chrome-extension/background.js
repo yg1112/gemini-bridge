@@ -1,20 +1,36 @@
-// background.js - v4.0 Singleton Architecture
+// background.js - v6.1 True Manual Mode (No Auto-Lock)
 let socket = null;
 let isConnecting = false;
+let dedicatedTabId = null;
 
 function connect() {
     if (isConnecting || (socket && socket.readyState === WebSocket.OPEN)) return;
     isConnecting = true;
 
-    console.log("🔌 Connecting to Proxy Server...");
+    console.log("🔌 Connecting to Proxy...");
     socket = new WebSocket('ws://localhost:3000/ws');
 
     socket.onopen = async () => {
-        console.log('✅ Connected to Proxy Server');
+        console.log('✅ Connected to Proxy');
         isConnecting = false;
         
-        // 连接成功后，唤醒/注入所有 Gemini 页面
-        await wakeUpTabs();
+        // 只唤醒所有标签页，让它们显示 UI，但不自动锁定任何一个
+        const tabs = await chrome.tabs.query({ url: "*://gemini.google.com/*" });
+        console.log(`🔍 Found ${tabs.length} Gemini tab(s)`);
+
+        for (const tab of tabs) {
+            // 注入脚本确保 UI 存在
+            await injectScript(tab.id);
+            await sleep(200);
+            
+            // 发送侦查报告请求，让 Content Script 更新自己的 UI
+            try {
+                await chrome.tabs.sendMessage(tab.id, { type: 'SCOUT_REPORT' });
+            } catch (e) {}
+        }
+
+        // ❌ 不再自动锁定！等待用户手动选择
+        console.log("🧘 Waiting for user to manually click 'Connect' in a Gemini tab...");
     };
 
     socket.onmessage = async (event) => {
@@ -22,110 +38,121 @@ function connect() {
             const data = JSON.parse(event.data);
             console.log(`📨 Received from proxy: ${data.id}`);
             
-            // 找到目标 Gemini 标签页
-            const tabs = await chrome.tabs.query({ url: "*://gemini.google.com/*" });
-            
-            // 优先使用活跃的标签页
-            let targetTab = tabs.find(t => t.active);
-            if (!targetTab && tabs.length > 0) {
-                targetTab = tabs[0];
-            }
-            
-            if (targetTab) {
-                await sendToTab(targetTab.id, data);
+            if (dedicatedTabId) {
+                console.log(`📤 Sending to dedicated tab: ${dedicatedTabId}`);
+                try {
+                    await chrome.tabs.sendMessage(dedicatedTabId, data);
+                } catch (err) {
+                    console.warn("⚠️ Target tab died, releasing lock...");
+                    dedicatedTabId = null;
+                }
             } else {
-                console.error("❌ No Gemini tab found");
+                // 没有锁定的 Tab，提示用户
+                console.warn("⚠️ No tab connected! Please click 'Connect' in a Gemini tab first.");
             }
         } catch (e) {
-            console.error("❌ Error processing message:", e);
+            console.error("❌ Error:", e);
         }
     };
 
     socket.onclose = () => {
         console.log("❌ WebSocket disconnected");
-        socket = null;
         isConnecting = false;
+        socket = null;
         setTimeout(connect, 3000);
     };
     
     socket.onerror = (e) => {
         console.error("❌ WebSocket error:", e);
-        socket = null;
         isConnecting = false;
     };
 }
 
-async function wakeUpTabs() {
-    try {
-        const tabs = await chrome.tabs.query({ url: "*://gemini.google.com/*" });
-        console.log(`🔍 Found ${tabs.length} Gemini tab(s)`);
-        
-        for (const tab of tabs) {
-            try {
-                const response = await chrome.tabs.sendMessage(tab.id, { type: 'PING' });
-                console.log(`🟢 Tab ${tab.id} alive (Instance: ${response.instanceId?.substring(0, 10)}...)`);
-            } catch (e) {
-                // Ping 失败，注入代码
-                console.log(`🟡 Tab ${tab.id} not responding, injecting...`);
-                await injectScript(tab.id);
-            }
-        }
-    } catch (e) {
-        console.error("❌ Wake up failed:", e);
-    }
-}
-
 async function injectScript(tabId) {
     try {
-        await chrome.scripting.executeScript({
-            target: { tabId: tabId },
-            files: ['content.js']
-        });
-        console.log(`✅ Injected into tab ${tabId}`);
+        // 先尝试 ping
+        await chrome.tabs.sendMessage(tabId, { type: 'PING' });
+        console.log(`🟢 Tab ${tabId} already has bridge`);
     } catch (e) {
-        console.error(`❌ Injection failed for tab ${tabId}:`, e);
-    }
-}
-
-async function sendToTab(tabId, data) {
-    try {
-        await chrome.tabs.sendMessage(tabId, data);
-        console.log(`📤 Sent to tab ${tabId}`);
-    } catch (e) {
-        console.log(`⚠️ Send failed, injecting and retrying...`);
-        await injectScript(tabId);
-        await new Promise(r => setTimeout(r, 500));
+        // Ping 失败，注入
+        console.log(`💉 Injecting into tab ${tabId}...`);
         try {
-            await chrome.tabs.sendMessage(tabId, data);
-            console.log(`📤 Retry successful`);
-        } catch (e2) {
-            console.error(`❌ Retry failed:`, e2);
+            await chrome.scripting.executeScript({
+                target: { tabId: tabId },
+                files: ['content.js']
+            });
+            console.log(`✅ Injected into tab ${tabId}`);
+        } catch (err) {
+            console.error(`❌ Injection failed for tab ${tabId}:`, err);
         }
     }
 }
 
-// 监听来自 content.js 的响应
-chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-    if (message.type === 'GEMINI_RESPONSE') {
-        console.log(`📥 Response from content: ID=${message.id}, Length=${message.content?.length || 0}`);
+async function lockTab(tabId) {
+    // 1. 释放旧锁
+    if (dedicatedTabId && dedicatedTabId !== tabId) {
+        try {
+            await chrome.tabs.sendMessage(dedicatedTabId, { type: 'LOCK_RELEASED' });
+            console.log(`🔓 Released old tab: ${dedicatedTabId}`);
+        } catch (e) {}
+    }
+
+    // 2. 锁定新的
+    dedicatedTabId = tabId;
+    try {
+        await chrome.tabs.sendMessage(tabId, { type: 'LOCK_GRANTED' });
+        console.log(`🔒 Locked to tab ${tabId}`);
+    } catch (e) {
+        console.error("❌ Lock failed:", e);
+        dedicatedTabId = null;
+    }
+}
+
+function sleep(ms) {
+    return new Promise(r => setTimeout(r, ms));
+}
+
+// 监听标签页关闭
+chrome.tabs.onRemoved.addListener((tabId) => {
+    if (tabId === dedicatedTabId) {
+        console.log("🔓 Dedicated tab closed. Releasing lock.");
+        dedicatedTabId = null;
+    }
+});
+
+// 监听来自 content.js 的消息
+chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
+    // 用户手动点击了 "Connect" 按钮
+    if (request.type === 'MANUAL_LOCK_REQUEST') {
+        if (sender.tab) {
+            console.log(`👆 User manually selected tab ${sender.tab.id}`);
+            lockTab(sender.tab.id);
+        }
+        return;
+    }
+    
+    // 转发响应给 WebSocket
+    if (request.type === 'GEMINI_RESPONSE') {
+        console.log(`📥 Response from content: ID=${request.id}, Length=${request.content?.length || 0}`);
         
         if (socket && socket.readyState === WebSocket.OPEN) {
             socket.send(JSON.stringify({
-                id: message.id,
-                content: message.content
+                id: request.id,
+                content: request.content
             }));
             console.log("✅ Response sent to proxy");
         } else {
-            console.error("❌ WebSocket not connected, cannot send response");
+            console.error("❌ WebSocket not connected");
         }
     }
+    
     return true;
 });
 
 // 初始连接
 connect();
 
-// Watchdog: 每 5 秒检查连接状态
+// Watchdog
 setInterval(() => {
     if (!socket || socket.readyState !== WebSocket.OPEN) {
         console.log("💓 Reconnecting...");
@@ -133,4 +160,4 @@ setInterval(() => {
     }
 }, 5000);
 
-console.log("🎉 Gemini Bridge Background v4.0 initialized");
+console.log("🎉 Gemini Bridge Background v6.1 (True Manual Mode) initialized");

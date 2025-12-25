@@ -1,207 +1,310 @@
-// content.js - v4.0 Singleton Architecture
+// content.js - v6.0 Smart UI & Manual Override (Gentleman Mode)
 (function() {
-    // --- 1. 单例控制 (核心修复) ---
-    // 生成当前实例的唯一 ID
+    // 1. 单例控制
     const currentInstanceId = Date.now() + "_" + Math.random().toString(36).substr(2, 9);
-    console.log(`🚀 Bridge Instance Starting: ${currentInstanceId}`);
-
-    // 抢占全局控制权
     window.__BRIDGE_INSTANCE_ID = currentInstanceId;
 
-    // --- 2. 状态定义 ---
-    const STATE = {
-        IDLE: 'idle',
-        TYPING: 'typing',
-        WAITING: 'waiting',
-        GENERATING: 'generating',
-        COMPLETE: 'complete'
-    };
-    let currentState = STATE.IDLE;
+    // UI 元素引用
+    let controlPanel = null;
+    let isLocked = false;
 
-    // --- 3. 消息监听器 ---
-    chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
-        // [关键] 自杀检查：如果当前全局 ID 不等于我的 ID，说明我是旧脚本，闭嘴退出
-        if (window.__BRIDGE_INSTANCE_ID !== currentInstanceId) {
-            console.warn(`👻 [Zombie] Instance ${currentInstanceId.substring(0, 10)}... is obsolete. Ignoring.`);
+    // --- 初始化 ---
+    function init() {
+        console.log(`🚀 Bridge v6.0 Initialized: ${currentInstanceId}`);
+        createControlPanel();
+        
+        chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
+            if (window.__BRIDGE_INSTANCE_ID !== currentInstanceId) {
+                console.warn(`👻 Zombie instance ${currentInstanceId.substring(0, 8)}... ignoring`);
+                return false;
+            }
+
+            console.log("📥 Received:", request.type || request);
+
+            // 1. 侦查请求：汇报当前页面状态
+            if (request.type === 'SCOUT_REPORT') {
+                const status = analyzePage();
+                sendResponse(status);
+                updateUI(status.isNewChat, false);
+                return;
+            }
+
+            // 2. 锁定通知：我被选中了
+            if (request.type === 'LOCK_GRANTED') {
+                isLocked = true;
+                setStatus('active');
+                updateUI(analyzePage().isNewChat, true);
+                sendResponse({ status: "locked" });
+                return;
+            }
+
+            // 3. 解锁通知：我被释放了
+            if (request.type === 'LOCK_RELEASED') {
+                isLocked = false;
+                setStatus('idle');
+                updateUI(analyzePage().isNewChat, false);
+                sendResponse({ status: "released" });
+                return;
+            }
+
+            // 4. PING
+            if (request.type === 'PING') {
+                sendResponse({ status: 'pong', instanceId: currentInstanceId, isLocked });
+                return;
+            }
+
+            // 5. 执行任务
+            if (request.prompt) {
+                sendResponse({ status: "processing" });
+                runTask(request.id, request.prompt);
+            }
+            
             return false;
-        }
+        });
+    }
 
-        console.log("📥 Received:", request);
+    // --- 页面分析逻辑 ---
+    function analyzePage() {
+        const historyCount = document.querySelectorAll('message-content, model-response').length;
+        const isNewChat = historyCount <= 1;
 
-        // PING 响应
-        if (request.type === 'PING') {
-            sendResponse({ status: 'pong', instanceId: currentInstanceId });
+        return {
+            instanceId: currentInstanceId,
+            isNewChat: isNewChat,
+            historyCount: historyCount,
+            title: document.title
+        };
+    }
+
+    // --- UI 界面逻辑 ---
+    function createControlPanel() {
+        if (document.getElementById('gemini-bridge-panel')) {
+            controlPanel = document.getElementById('gemini-bridge-panel');
             return;
         }
 
-        // 立即握手
-        sendResponse({ status: 'processing' });
+        const panel = document.createElement('div');
+        panel.id = 'gemini-bridge-panel';
+        panel.style.cssText = `
+            position: fixed;
+            top: 10px;
+            right: 10px;
+            z-index: 99999;
+            background: rgba(0, 0, 0, 0.85);
+            color: white;
+            padding: 10px 14px;
+            border-radius: 10px;
+            font-family: -apple-system, BlinkMacSystemFont, sans-serif;
+            font-size: 13px;
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+            transition: all 0.3s ease;
+        `;
 
-        if (request.prompt) {
-            runTask(request.id, request.prompt);
+        const statusText = document.createElement('span');
+        statusText.id = 'gb-status-text';
+        statusText.innerText = '🔍 Bridge Detected';
+
+        const actionBtn = document.createElement('button');
+        actionBtn.id = 'gb-action-btn';
+        actionBtn.innerText = 'Connect';
+        actionBtn.style.cssText = `
+            background: #4CAF50;
+            border: none;
+            color: white;
+            padding: 6px 12px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-weight: 600;
+            font-size: 12px;
+            transition: all 0.2s ease;
+        `;
+        
+        actionBtn.onmouseenter = () => actionBtn.style.opacity = '0.8';
+        actionBtn.onmouseleave = () => actionBtn.style.opacity = '1';
+        
+        actionBtn.onclick = () => {
+            console.log("👆 User manually activated this tab");
+            chrome.runtime.sendMessage({ 
+                type: 'MANUAL_LOCK_REQUEST', 
+                instanceId: currentInstanceId 
+            });
+        };
+
+        panel.appendChild(statusText);
+        panel.appendChild(actionBtn);
+        document.body.appendChild(panel);
+        controlPanel = panel;
+        
+        // 初始状态
+        updateUI(analyzePage().isNewChat, false);
+    }
+
+    function updateUI(isNewChat, locked) {
+        if (!controlPanel) return;
+        const text = controlPanel.querySelector('#gb-status-text');
+        const btn = controlPanel.querySelector('#gb-action-btn');
+
+        if (locked) {
+            controlPanel.style.border = "2px solid #4CAF50";
+            controlPanel.style.background = "rgba(76, 175, 80, 0.9)";
+            text.innerText = "🟢 Bridge ACTIVE";
+            btn.style.display = 'none';
+            document.body.style.borderTop = "4px solid #4CAF50";
+        } else {
+            document.body.style.borderTop = "none";
+            controlPanel.style.background = "rgba(0, 0, 0, 0.85)";
+            
+            if (isNewChat) {
+                controlPanel.style.border = "2px solid #FFC107";
+                text.innerText = "🟡 Ready (New Chat)";
+                btn.innerText = "Connect";
+                btn.style.display = 'block';
+                btn.style.background = '#4CAF50';
+            } else {
+                controlPanel.style.border = "2px solid #FF5722";
+                text.innerText = "🔴 Busy (Has History)";
+                btn.innerText = "Force Connect";
+                btn.style.display = 'block';
+                btn.style.background = '#FF5722';
+            }
         }
-        return false;
-    });
+    }
 
-    // --- 4. 任务执行主流程 ---
+    function setStatus(status) {
+        if (status === 'active') {
+            document.body.style.borderTop = "4px solid #4CAF50";
+        } else if (status === 'working') {
+            document.body.style.borderTop = "4px solid orange";
+        } else if (status === 'success') {
+            document.body.style.borderTop = "4px solid #4CAF50";
+            setTimeout(() => {
+                if (isLocked) document.body.style.borderTop = "4px solid #4CAF50";
+                else document.body.style.borderTop = "none";
+            }, 2000);
+        } else if (status === 'error') {
+            document.body.style.borderTop = "4px solid red";
+            setTimeout(() => {
+                if (isLocked) document.body.style.borderTop = "4px solid #4CAF50";
+                else document.body.style.borderTop = "none";
+            }, 3000);
+        } else {
+            if (!isLocked) document.body.style.borderTop = "none";
+        }
+    }
+
+    // --- 任务执行 ---
     async function runTask(id, text) {
         try {
-            currentState = STATE.TYPING;
             setStatus('working');
             console.log(`🎯 [runTask] ID: ${id}, Text: "${text.substring(0, 30)}..."`);
 
-            // A. 寻找并聚焦输入框
             const inputArea = await waitForElement([
                 'div[contenteditable="true"]',
                 'rich-textarea div p',
                 '[role="textbox"]'
             ]);
-            console.log("✅ Found input area");
             
             inputArea.focus();
             await sleep(100);
             
-            // B. 拟人化输入
-            console.log("⌨️ Starting human-like typing...");
-            
-            // 先清空
+            // 清空并逐字输入
             document.execCommand('selectAll', false, null);
             document.execCommand('delete', false, null);
             await sleep(50);
             
-            // 逐字输入
             for (const char of text) {
-                // 检查是否被新脚本中断
-                if (window.__BRIDGE_INSTANCE_ID !== currentInstanceId) {
-                    console.warn("👻 Interrupted by new instance");
-                    return;
-                }
-
+                if (window.__BRIDGE_INSTANCE_ID !== currentInstanceId) return;
                 document.execCommand('insertText', false, char);
-                await sleep(Math.random() * 35 + 15);
+                await sleep(Math.random() * 25 + 10);
             }
+            
             console.log("✅ Text filled");
-
-            // C. 发送指令
             await sleep(300 + Math.random() * 200);
             
+            // 发送
             const sendBtn = document.querySelector('button[aria-label*="Send"], button[aria-label*="发送"], .send-button');
             if (sendBtn && !sendBtn.disabled) {
-                console.log("🖱️ Clicking send button");
                 sendBtn.click();
+                console.log("🖱️ Clicked send button");
             } else {
-                console.log("⌨️ Using Enter key");
-                const enterEvent = new KeyboardEvent('keydown', {
-                    bubbles: true, cancelable: true, keyCode: 13, key: 'Enter', code: 'Enter'
-                });
-                inputArea.dispatchEvent(enterEvent);
+                inputArea.dispatchEvent(new KeyboardEvent('keydown', {
+                    keyCode: 13, key: 'Enter', code: 'Enter', bubbles: true
+                }));
+                console.log("⌨️ Sent with Enter key");
             }
-
-            // D. 监控响应
+            
             await waitForResponse(id);
-
+            
         } catch (e) {
-            console.error("❌ Task Failed:", e);
-            reportResult(id, `Error: ${e.message}`);
+            console.error("❌ Task failed:", e);
+            chrome.runtime.sendMessage({ type: 'GEMINI_RESPONSE', id, content: `Error: ${e.message}` });
             setStatus('error');
-        } finally {
-            currentState = STATE.IDLE;
         }
     }
 
-    // --- 5. 响应监控 (MutationObserver + 状态机) ---
+    // --- 响应监控 ---
     function waitForResponse(id) {
-        return new Promise((resolve, reject) => {
+        return new Promise((resolve) => {
             console.log("⏳ Waiting for response...");
-            currentState = STATE.WAITING;
-
-            let responseText = "";
-            let silenceTimer = null;
             let hasStarted = false;
-            let startWaitTime = Date.now();
-            
-            // 观察器：监听 DOM 变化
-            const observer = new MutationObserver((mutations) => {
-                // 自杀检查
+            let silenceTimer = null;
+            let startTime = Date.now();
+
+            const observer = new MutationObserver(() => {
                 if (window.__BRIDGE_INSTANCE_ID !== currentInstanceId) {
-                    console.warn("👻 Observer killed by new instance");
                     observer.disconnect();
                     return;
                 }
 
-                // 检测 Stop 按钮（最可靠的生成中标志）
                 const stopBtn = document.querySelector('button[aria-label*="Stop"], button[aria-label*="停止"]');
                 
                 if (stopBtn) {
                     if (!hasStarted) {
-                        console.log("🚀 Generation Started (Stop button found)");
+                        console.log("🚀 Generation started");
                         hasStarted = true;
-                        currentState = STATE.GENERATING;
                     }
-                    // 还在生成，重置静默计时器
                     if (silenceTimer) {
                         clearTimeout(silenceTimer);
                         silenceTimer = null;
                     }
-                } 
-                else if (hasStarted) {
-                    // 曾经开始过，现在 Stop 按钮没了 -> 可能结束了
+                } else if (hasStarted) {
                     if (!silenceTimer) {
-                        console.log("⏸️ Stop button gone, waiting for stability...");
                         silenceTimer = setTimeout(() => {
                             finish();
                         }, 1500);
                     }
-                }
-                else {
-                    // 还没开始，检测页面变化
-                    const elapsed = Date.now() - startWaitTime;
-                    
-                    // 备用检测：页面文本增长
-                    const modelResponses = document.querySelectorAll('model-response');
-                    if (modelResponses.length > 0) {
-                        const lastResponse = modelResponses[modelResponses.length - 1];
-                        const text = lastResponse.innerText || "";
-                        if (text.length > 10) {
-                            console.log("🚀 Generation Started (text detected)");
-                            hasStarted = true;
-                            currentState = STATE.GENERATING;
-                        }
-                    }
-                    
-                    // 超时检查
-                    if (elapsed > 15000 && !hasStarted) {
-                        console.error("❌ No response started after 15s");
+                } else {
+                    // 检查是否有新内容
+                    const elapsed = Date.now() - startTime;
+                    if (elapsed > 15000) {
+                        console.error("❌ No response after 15s");
                         observer.disconnect();
-                        reportResult(id, "Error: Gemini did not start responding. Message may not have been sent.");
+                        chrome.runtime.sendMessage({ 
+                            type: 'GEMINI_RESPONSE', 
+                            id, 
+                            content: "Error: No response from Gemini" 
+                        });
                         setStatus('error');
                         resolve();
                     }
                 }
             });
 
-            observer.observe(document.body, { 
-                childList: true, 
-                subtree: true, 
-                characterData: true 
-            });
-
-            // 提取结果并结束
             const finish = () => {
                 observer.disconnect();
-                currentState = STATE.COMPLETE;
                 
-                // 提取最后一条回答
+                let responseText = "";
                 const responses = document.querySelectorAll('model-response');
                 if (responses.length > 0) {
                     const lastNode = responses[responses.length - 1];
-                    // 尝试找 .markdown 子元素
                     const markdown = lastNode.querySelector('.markdown');
                     responseText = markdown 
                         ? (markdown.textContent || markdown.innerText)
                         : (lastNode.innerText || lastNode.textContent);
                     
-                    // 清理
                     responseText = responseText
                         .replace(/Show thinking/g, '')
                         .replace(/View analysis/g, '')
@@ -209,63 +312,35 @@
                         .trim();
                 }
                 
-                if (!responseText || responseText.length < 5) {
-                    responseText = "Error: Could not extract response text";
+                if (!responseText || responseText.length < 3) {
+                    responseText = "Error: Could not extract response";
                 }
 
-                console.log(`✅ Generation Complete! Length: ${responseText.length}`);
-                console.log(`📄 Preview: ${responseText.substring(0, 100)}...`);
-                
-                reportResult(id, responseText);
+                console.log(`✅ Done! Length: ${responseText.length}`);
+                chrome.runtime.sendMessage({ type: 'GEMINI_RESPONSE', id, content: responseText });
                 setStatus('success');
                 resolve();
             };
 
-            // 60秒硬超时兜底
+            observer.observe(document.body, { childList: true, subtree: true, characterData: true });
+
+            // 60s 硬超时
             setTimeout(() => {
-                if (currentState !== STATE.IDLE && currentState !== STATE.COMPLETE) {
-                    observer.disconnect();
-                    console.warn("⏱️ Hard Timeout (60s)");
-                    
-                    if (hasStarted) {
-                        // 如果已经开始生成，尝试提取现有内容
-                        finish();
-                    } else {
-                        reportResult(id, "Error: Timeout - Gemini did not respond");
-                        setStatus('error');
-                        resolve();
-                    }
+                observer.disconnect();
+                if (hasStarted) {
+                    finish();
+                } else {
+                    chrome.runtime.sendMessage({ type: 'GEMINI_RESPONSE', id, content: "Error: Timeout" });
+                    setStatus('error');
+                    resolve();
                 }
             }, 60000);
         });
     }
 
-    // --- 辅助工具 ---
-    function reportResult(id, content) {
-        console.log(`📤 Sending result for ID: ${id}`);
-        chrome.runtime.sendMessage({ 
-            type: 'GEMINI_RESPONSE', 
-            id: id, 
-            content: content 
-        }).catch(err => console.error("Failed to send result:", err));
-    }
-
-    function setStatus(status) {
-        if (status === 'working') {
-            document.body.style.borderTop = "5px solid orange";
-        } else if (status === 'success') {
-            document.body.style.borderTop = "5px solid green";
-            setTimeout(() => document.body.style.borderTop = "none", 2000);
-        } else if (status === 'error') {
-            document.body.style.borderTop = "5px solid red";
-            setTimeout(() => document.body.style.borderTop = "none", 3000);
-        } else {
-            document.body.style.borderTop = "none";
-        }
-    }
-
+    // --- 工具函数 ---
     function sleep(ms) {
-        return new Promise(resolve => setTimeout(resolve, ms));
+        return new Promise(r => setTimeout(r, ms));
     }
 
     async function waitForElement(selectors, timeout = 5000) {
@@ -277,8 +352,9 @@
             }
             await sleep(100);
         }
-        throw new Error("Element not found: " + selectors.join(", "));
+        throw new Error("Element not found");
     }
 
-    console.log(`✅ Instance ${currentInstanceId} Ready and Listening.`);
+    init();
+    console.log(`✅ Instance ${currentInstanceId} Ready`);
 })();
