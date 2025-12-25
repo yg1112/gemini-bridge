@@ -13,13 +13,45 @@ function setStatus(status) {
     }
 }
 
+// 模拟真实鼠标点击（针对 React 应用）
+function simulateClick(element) {
+    console.log("🖱️ [simulateClick] Simulating real mouse click");
+    
+    // 确保元素可见且可交互
+    element.scrollIntoView({ behavior: 'instant', block: 'center' });
+    
+    const rect = element.getBoundingClientRect();
+    const x = rect.left + rect.width / 2;
+    const y = rect.top + rect.height / 2;
+    
+    // 依次触发完整的鼠标事件序列
+    const eventOptions = {
+        view: window,
+        bubbles: true,
+        cancelable: true,
+        clientX: x,
+        clientY: y,
+        button: 0
+    };
+    
+    element.dispatchEvent(new MouseEvent('mousedown', eventOptions));
+    element.dispatchEvent(new MouseEvent('mouseup', eventOptions));
+    element.dispatchEvent(new MouseEvent('click', eventOptions));
+    
+    console.log("✅ [simulateClick] Mouse event sequence completed");
+}
+
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     console.log("📥 Received prompt:", request);
     if (request.prompt) {
+        // 立即确认收到，避免 message channel closed 错误
+        sendResponse({status: "processing"});
+        // 独立运行，不阻塞消息通道
         setStatus('working');
         runPrompt(request.id, request.prompt);
     }
-    return true;
+    // 不返回 true，因为我们已经同步调用了 sendResponse
+    return false;
 });
 
 async function runPrompt(id, text) {
@@ -56,7 +88,7 @@ async function runPrompt(id, text) {
     document.execCommand('insertText', false, text);
     console.log("✅ [runPrompt] Text filled");
     
-    // 3. 点击发送
+    // 3. 点击发送（使用模拟点击）
     await new Promise(r => setTimeout(r, 800)); // 稍等 UI 反应
     
     const sendBtnSelectors = [
@@ -75,16 +107,69 @@ async function runPrompt(id, text) {
         }
     }
     
+    let sendSuccess = false;
+    
     if (sendBtn) {
-        console.log("🚀 [runPrompt] Clicking send button");
-        sendBtn.click();
+        console.log("🚀 [runPrompt] Attempting to send with button click");
+        simulateClick(sendBtn);
+        
+        // 验证发送是否成功（检查输入框是否清空）
+        await new Promise(r => setTimeout(r, 2000));
+        const currentText = inputArea.innerText || inputArea.textContent || inputArea.value || "";
+        
+        if (currentText.trim().length === 0) {
+            console.log("✅ [runPrompt] Send successful - input cleared");
+            sendSuccess = true;
+        } else {
+            console.warn("⚠️ [runPrompt] Send may have failed - input still has text, trying Enter key");
+            // 尝试回车键
+            const enterEvent = new KeyboardEvent('keydown', {
+                bubbles: true, 
+                cancelable: true, 
+                keyCode: 13, 
+                key: 'Enter', 
+                code: 'Enter',
+                which: 13
+            });
+            inputArea.dispatchEvent(enterEvent);
+            
+            await new Promise(r => setTimeout(r, 1000));
+            const finalText = inputArea.innerText || inputArea.textContent || inputArea.value || "";
+            sendSuccess = finalText.trim().length === 0;
+            
+            if (sendSuccess) {
+                console.log("✅ [runPrompt] Send successful with Enter key");
+            } else {
+                console.error("❌ [runPrompt] Send failed - text still in input box");
+            }
+        }
     } else {
         console.log("⚠️ [runPrompt] No send button found, using Enter key");
         // 回退方案：回车键
         const enterEvent = new KeyboardEvent('keydown', {
-            bubbles: true, cancelable: true, keyCode: 13, key: 'Enter', code: 'Enter'
+            bubbles: true, 
+            cancelable: true, 
+            keyCode: 13, 
+            key: 'Enter', 
+            code: 'Enter',
+            which: 13
         });
         inputArea.dispatchEvent(enterEvent);
+        
+        await new Promise(r => setTimeout(r, 1000));
+        const finalText = inputArea.innerText || inputArea.textContent || inputArea.value || "";
+        sendSuccess = finalText.trim().length === 0;
+    }
+
+    if (!sendSuccess) {
+        console.error("❌ [runPrompt] Failed to send message");
+        chrome.runtime.sendMessage({ 
+            type: 'GEMINI_RESPONSE', 
+            id: id, 
+            content: "Error: Failed to send message to Gemini. Input box did not clear." 
+        });
+        setStatus('error');
+        return;
     }
 
     // 4. 等待响应
@@ -108,15 +193,23 @@ function waitForResponse(id, userPrompt = "") {
     let lastText = initialText;
     let lastLength = initialLength;
     let stableCount = 0;
-    const maxStable = 3; // 连续 3 次检查文本没变，认为生成结束（减少等待时间）
-    const checkInterval = 800; // 每 800ms 检查一次（更频繁）
+    const maxStable = 3; // 连续 3 次检查文本没变，认为生成结束
+    const checkInterval = 800; // 每 800ms 检查一次
     let checkCount = 0;
     let hasDetectedGrowth = false; // 是否检测到文本增长
+    let lastGrowthTime = Date.now(); // 最后一次检测到文本增长的时间
     
     const checkLoop = setInterval(() => {
         checkCount++;
         const currentText = getPageText();
         const currentLength = currentText.length;
+        
+        // 检测"Stop responding"按钮（正在生成中的标志）
+        const stopBtn = Array.from(document.querySelectorAll('button, [role="button"]')).find(btn => {
+            const text = btn.innerText || btn.textContent || "";
+            return text.includes("Stop responding") || text.includes("停止响应");
+        });
+        const isGenerating = !!stopBtn;
         
         // 检测响应完成的多种方法
         // 1. 检测"Show thinking"按钮（Gemini响应完成的标志）
@@ -154,7 +247,7 @@ function waitForResponse(id, userPrompt = "") {
             }
         }
 
-        console.log(`🔍 [waitForResponse] Check #${checkCount}: Length=${currentLength}, ResponseText=${responseText.length}, Stable=${stableCount}/${maxStable}, InputReady=${isInputReady}`);
+        console.log(`🔍 [waitForResponse] Check #${checkCount}: Length=${currentLength}, ResponseText=${responseText.length}, Stable=${stableCount}/${maxStable}, InputReady=${isInputReady}, Generating=${isGenerating}`);
 
         // 检测文本是否在增长
         if (currentLength > lastLength) {
@@ -163,20 +256,27 @@ function waitForResponse(id, userPrompt = "") {
             lastLength = currentLength;
             stableCount = 0;
             hasDetectedGrowth = true;
+            lastGrowthTime = Date.now();
         } else if (currentLength === lastLength && currentLength > initialLength) {
             // 长度稳定且比初始长度大（说明有内容）
-            stableCount++;
-            console.log(`📊 [waitForResponse] Text stable (${stableCount}/${maxStable}): ${currentLength} chars`);
+            // 如果正在生成中（有 Stop 按钮），不增加稳定计数
+            if (!isGenerating) {
+                stableCount++;
+                console.log(`📊 [waitForResponse] Text stable (${stableCount}/${maxStable}): ${currentLength} chars`);
+            } else {
+                console.log(`⏸️ [waitForResponse] Still generating (Stop button visible), resetting stability`);
+                stableCount = 0; // 重置，因为还在生成中
+            }
         }
 
         // 检测完成条件：多种方式
         const isComplete = (
-            // 方式1: 文本稳定且检测到过增长
-            (stableCount >= maxStable && hasDetectedGrowth && currentLength > initialLength) ||
+            // 方式1: 文本稳定且检测到过增长，且不在生成中
+            (stableCount >= maxStable && hasDetectedGrowth && currentLength > initialLength && !isGenerating) ||
             // 方式2: 输入框重新可用且文本长度大于初始值（说明响应已完成）
-            (isInputReady && hasDetectedGrowth && currentLength > initialLength && stableCount >= 2) ||
-            // 方式3: 找到响应文本且稳定
-            (responseText && responseText.length > 0 && stableCount >= 2)
+            (isInputReady && hasDetectedGrowth && currentLength > initialLength && stableCount >= 2 && !isGenerating) ||
+            // 方式3: 找到响应文本且稳定且不在生成中
+            (responseText && responseText.length > 0 && stableCount >= 2 && !isGenerating)
         );
 
         if (isComplete) {
@@ -263,18 +363,56 @@ function waitForResponse(id, userPrompt = "") {
         }
     }, checkInterval);
     
-    // 120秒硬超时
+    // 120秒硬超时（兜底逻辑优化）
     setTimeout(() => {
         clearInterval(checkLoop);
         console.warn(`⏱️ [waitForResponse] Timeout after 120s, stableCount=${stableCount}, hasDetectedGrowth=${hasDetectedGrowth}`);
+        
         if (stableCount < maxStable) {
-            chrome.runtime.sendMessage({ 
-                type: 'GEMINI_RESPONSE', 
-                id: id, 
-                content: "Error: Timeout waiting for DOM stability." 
-            }).catch(err => {
-                console.error("❌ [waitForResponse] Failed to send timeout response:", err);
-            });
+            // 如果检测到了文本增长，返回已捕获的内容而不是错误
+            if (hasDetectedGrowth && lastLength > initialLength) {
+                console.log("🔄 [waitForResponse] Timeout but content was generated, returning partial response");
+                
+                // 尝试获取当前的响应文本
+                let partialText = "";
+                const modelResponses = document.querySelectorAll('model-response.ng-star-inserted');
+                if (modelResponses.length > 0) {
+                    const lastModelResponse = modelResponses[modelResponses.length - 1];
+                    const messageContent = lastModelResponse.querySelector('message-content .markdown, .markdown-main-panel, [id^="message-content-id"]');
+                    if (messageContent) {
+                        partialText = messageContent.innerText || messageContent.textContent || "";
+                    }
+                }
+                
+                // 如果找到了内容，返回它；否则返回增量文本
+                if (partialText && partialText.length > 0) {
+                    chrome.runtime.sendMessage({ 
+                        type: 'GEMINI_RESPONSE', 
+                        id: id, 
+                        content: partialText.trim()
+                    }).catch(err => {
+                        console.error("❌ [waitForResponse] Failed to send partial response:", err);
+                    });
+                } else {
+                    const diffText = lastText.substring(initialLength);
+                    chrome.runtime.sendMessage({ 
+                        type: 'GEMINI_RESPONSE', 
+                        id: id, 
+                        content: diffText.trim() || "Response partially captured but extraction incomplete."
+                    }).catch(err => {
+                        console.error("❌ [waitForResponse] Failed to send diff response:", err);
+                    });
+                }
+            } else {
+                // 没有检测到任何内容生成，返回错误
+                chrome.runtime.sendMessage({ 
+                    type: 'GEMINI_RESPONSE', 
+                    id: id, 
+                    content: "Error: Timeout waiting for DOM stability." 
+                }).catch(err => {
+                    console.error("❌ [waitForResponse] Failed to send timeout response:", err);
+                });
+            }
         }
     }, 120000);
 }
