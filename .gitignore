@@ -13,3 +13,4 @@ ENV/
 *.swo
 *~
 
+.aider*
