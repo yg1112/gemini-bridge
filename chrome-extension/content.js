@@ -1,311 +1,284 @@
-// 防止重复注入 - 使用 IIFE 包装
+// content.js - v4.0 Singleton Architecture
 (function() {
-    if (window.GEMINI_BRIDGE_LOADED) {
-        console.log("🔄 Gemini Bridge already loaded, skipping re-injection");
-        return;
-    }
-    window.GEMINI_BRIDGE_LOADED = true;
+    // --- 1. 单例控制 (核心修复) ---
+    // 生成当前实例的唯一 ID
+    const currentInstanceId = Date.now() + "_" + Math.random().toString(36).substr(2, 9);
+    console.log(`🚀 Bridge Instance Starting: ${currentInstanceId}`);
 
-    console.log("🚀 Gemini Bridge Loaded - v2.0 Debug Mode");
+    // 抢占全局控制权
+    window.__BRIDGE_INSTANCE_ID = currentInstanceId;
 
-// 视觉反馈辅助函数
-function setStatus(status) {
-    if (status === 'working') {
-        document.body.style.border = "5px solid red";
-    } else if (status === 'success') {
-        document.body.style.border = "5px solid green";
-        setTimeout(() => document.body.style.border = "none", 1000);
-    } else {
-        document.body.style.border = "none";
-    }
-}
+    // --- 2. 状态定义 ---
+    const STATE = {
+        IDLE: 'idle',
+        TYPING: 'typing',
+        WAITING: 'waiting',
+        GENERATING: 'generating',
+        COMPLETE: 'complete'
+    };
+    let currentState = STATE.IDLE;
 
-chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
-    console.log("📥 Received prompt:", request);
-    
-    // 处理 PING 消息（健康检查）
-    if (request.type === 'PING') {
-        sendResponse({status: "alive"});
-        return;
-    }
-    
-    // 处理正常的提示消息
-    if (request.prompt) {
-        sendResponse({status: "received"});
-        setStatus('working');
-        runPrompt(request.id, request.prompt);
-    }
-});
+    // --- 3. 消息监听器 ---
+    chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
+        // [关键] 自杀检查：如果当前全局 ID 不等于我的 ID，说明我是旧脚本，闭嘴退出
+        if (window.__BRIDGE_INSTANCE_ID !== currentInstanceId) {
+            console.warn(`👻 [Zombie] Instance ${currentInstanceId.substring(0, 10)}... is obsolete. Ignoring.`);
+            return false;
+        }
 
-async function runPrompt(id, text) {
-    console.log(`🎯 [runPrompt] ID: ${id}, Text length: ${text.length}`);
-    
-    // 1. 寻找输入框
-    const selectors = [
-        'div[contenteditable="true"]',
-        'rich-textarea div p',
-        'textarea',
-        '[role="textbox"]'
-    ];
-    
-    let inputArea = null;
-    for (const sel of selectors) {
-        inputArea = document.querySelector(sel);
-        if (inputArea) {
-            console.log(`✅ [runPrompt] Found input with selector: ${sel}`);
-            break;
+        console.log("📥 Received:", request);
+
+        // PING 响应
+        if (request.type === 'PING') {
+            sendResponse({ status: 'pong', instanceId: currentInstanceId });
+            return;
+        }
+
+        // 立即握手
+        sendResponse({ status: 'processing' });
+
+        if (request.prompt) {
+            runTask(request.id, request.prompt);
+        }
+        return false;
+    });
+
+    // --- 4. 任务执行主流程 ---
+    async function runTask(id, text) {
+        try {
+            currentState = STATE.TYPING;
+            setStatus('working');
+            console.log(`🎯 [runTask] ID: ${id}, Text: "${text.substring(0, 30)}..."`);
+
+            // A. 寻找并聚焦输入框
+            const inputArea = await waitForElement([
+                'div[contenteditable="true"]',
+                'rich-textarea div p',
+                '[role="textbox"]'
+            ]);
+            console.log("✅ Found input area");
+            
+            inputArea.focus();
+            await sleep(100);
+            
+            // B. 拟人化输入
+            console.log("⌨️ Starting human-like typing...");
+            
+            // 先清空
+            document.execCommand('selectAll', false, null);
+            document.execCommand('delete', false, null);
+            await sleep(50);
+            
+            // 逐字输入
+            for (const char of text) {
+                // 检查是否被新脚本中断
+                if (window.__BRIDGE_INSTANCE_ID !== currentInstanceId) {
+                    console.warn("👻 Interrupted by new instance");
+                    return;
+                }
+
+                document.execCommand('insertText', false, char);
+                await sleep(Math.random() * 35 + 15);
+            }
+            console.log("✅ Text filled");
+
+            // C. 发送指令
+            await sleep(300 + Math.random() * 200);
+            
+            const sendBtn = document.querySelector('button[aria-label*="Send"], button[aria-label*="发送"], .send-button');
+            if (sendBtn && !sendBtn.disabled) {
+                console.log("🖱️ Clicking send button");
+                sendBtn.click();
+            } else {
+                console.log("⌨️ Using Enter key");
+                const enterEvent = new KeyboardEvent('keydown', {
+                    bubbles: true, cancelable: true, keyCode: 13, key: 'Enter', code: 'Enter'
+                });
+                inputArea.dispatchEvent(enterEvent);
+            }
+
+            // D. 监控响应
+            await waitForResponse(id);
+
+        } catch (e) {
+            console.error("❌ Task Failed:", e);
+            reportResult(id, `Error: ${e.message}`);
+            setStatus('error');
+        } finally {
+            currentState = STATE.IDLE;
         }
     }
 
-    if (!inputArea) {
-        console.error("❌ [runPrompt] 找不到输入框");
+    // --- 5. 响应监控 (MutationObserver + 状态机) ---
+    function waitForResponse(id) {
+        return new Promise((resolve, reject) => {
+            console.log("⏳ Waiting for response...");
+            currentState = STATE.WAITING;
+
+            let responseText = "";
+            let silenceTimer = null;
+            let hasStarted = false;
+            let startWaitTime = Date.now();
+            
+            // 观察器：监听 DOM 变化
+            const observer = new MutationObserver((mutations) => {
+                // 自杀检查
+                if (window.__BRIDGE_INSTANCE_ID !== currentInstanceId) {
+                    console.warn("👻 Observer killed by new instance");
+                    observer.disconnect();
+                    return;
+                }
+
+                // 检测 Stop 按钮（最可靠的生成中标志）
+                const stopBtn = document.querySelector('button[aria-label*="Stop"], button[aria-label*="停止"]');
+                
+                if (stopBtn) {
+                    if (!hasStarted) {
+                        console.log("🚀 Generation Started (Stop button found)");
+                        hasStarted = true;
+                        currentState = STATE.GENERATING;
+                    }
+                    // 还在生成，重置静默计时器
+                    if (silenceTimer) {
+                        clearTimeout(silenceTimer);
+                        silenceTimer = null;
+                    }
+                } 
+                else if (hasStarted) {
+                    // 曾经开始过，现在 Stop 按钮没了 -> 可能结束了
+                    if (!silenceTimer) {
+                        console.log("⏸️ Stop button gone, waiting for stability...");
+                        silenceTimer = setTimeout(() => {
+                            finish();
+                        }, 1500);
+                    }
+                }
+                else {
+                    // 还没开始，检测页面变化
+                    const elapsed = Date.now() - startWaitTime;
+                    
+                    // 备用检测：页面文本增长
+                    const modelResponses = document.querySelectorAll('model-response');
+                    if (modelResponses.length > 0) {
+                        const lastResponse = modelResponses[modelResponses.length - 1];
+                        const text = lastResponse.innerText || "";
+                        if (text.length > 10) {
+                            console.log("🚀 Generation Started (text detected)");
+                            hasStarted = true;
+                            currentState = STATE.GENERATING;
+                        }
+                    }
+                    
+                    // 超时检查
+                    if (elapsed > 15000 && !hasStarted) {
+                        console.error("❌ No response started after 15s");
+                        observer.disconnect();
+                        reportResult(id, "Error: Gemini did not start responding. Message may not have been sent.");
+                        setStatus('error');
+                        resolve();
+                    }
+                }
+            });
+
+            observer.observe(document.body, { 
+                childList: true, 
+                subtree: true, 
+                characterData: true 
+            });
+
+            // 提取结果并结束
+            const finish = () => {
+                observer.disconnect();
+                currentState = STATE.COMPLETE;
+                
+                // 提取最后一条回答
+                const responses = document.querySelectorAll('model-response');
+                if (responses.length > 0) {
+                    const lastNode = responses[responses.length - 1];
+                    // 尝试找 .markdown 子元素
+                    const markdown = lastNode.querySelector('.markdown');
+                    responseText = markdown 
+                        ? (markdown.textContent || markdown.innerText)
+                        : (lastNode.innerText || lastNode.textContent);
+                    
+                    // 清理
+                    responseText = responseText
+                        .replace(/Show thinking/g, '')
+                        .replace(/View analysis/g, '')
+                        .replace(/Gemini can make mistakes.*$/gim, '')
+                        .trim();
+                }
+                
+                if (!responseText || responseText.length < 5) {
+                    responseText = "Error: Could not extract response text";
+                }
+
+                console.log(`✅ Generation Complete! Length: ${responseText.length}`);
+                console.log(`📄 Preview: ${responseText.substring(0, 100)}...`);
+                
+                reportResult(id, responseText);
+                setStatus('success');
+                resolve();
+            };
+
+            // 60秒硬超时兜底
+            setTimeout(() => {
+                if (currentState !== STATE.IDLE && currentState !== STATE.COMPLETE) {
+                    observer.disconnect();
+                    console.warn("⏱️ Hard Timeout (60s)");
+                    
+                    if (hasStarted) {
+                        // 如果已经开始生成，尝试提取现有内容
+                        finish();
+                    } else {
+                        reportResult(id, "Error: Timeout - Gemini did not respond");
+                        setStatus('error');
+                        resolve();
+                    }
+                }
+            }, 60000);
+        });
+    }
+
+    // --- 辅助工具 ---
+    function reportResult(id, content) {
+        console.log(`📤 Sending result for ID: ${id}`);
         chrome.runtime.sendMessage({ 
             type: 'GEMINI_RESPONSE', 
             id: id, 
-            content: "Error: Input box not found on page." 
-        });
-        setStatus('error');
-        return;
+            content: content 
+        }).catch(err => console.error("Failed to send result:", err));
     }
 
-    // 2. 填入文本
-    console.log("📝 [runPrompt] Filling text...");
-    inputArea.focus();
-    
-    if (inputArea.contentEditable === 'true') {
-        inputArea.innerText = '';
-        inputArea.focus();
-        document.execCommand('insertText', false, text);
-    } else {
-        inputArea.value = text;
-    }
-    
-    const inputEvent = new Event('input', { bubbles: true, cancelable: true });
-    inputArea.dispatchEvent(inputEvent);
-    
-    console.log("✅ [runPrompt] Text filled");
-    
-    // 3. 拟人化延迟 - 模拟人类的"思考时间"
-    const humanDelay = Math.random() * 500 + 500; // 500ms-1000ms 随机延迟
-    console.log(`⏱️ [runPrompt] Human-like delay: ${Math.round(humanDelay)}ms`);
-    await new Promise(r => setTimeout(r, humanDelay));
-    
-    // 4. 使用键盘方式发送
-    console.log("🚀 [runPrompt] Sending with Enter key");
-    
-    const sendEnter = () => {
-        const eventOptions = {
-            bubbles: true,
-            cancelable: true,
-            key: 'Enter',
-            code: 'Enter',
-            keyCode: 13,
-            which: 13,
-            view: window
-        };
-        
-        inputArea.dispatchEvent(new KeyboardEvent('keydown', eventOptions));
-        inputArea.dispatchEvent(new KeyboardEvent('keypress', eventOptions));
-        inputArea.dispatchEvent(new KeyboardEvent('keyup', eventOptions));
-    };
-    
-    // 连续发送两次 Enter
-    sendEnter();
-    await new Promise(r => setTimeout(r, 50));
-    sendEnter();
-    
-    // 验证发送
-    await new Promise(r => setTimeout(r, 1500));
-    const currentText = inputArea.innerText || inputArea.textContent || inputArea.value || "";
-    const sendSuccess = currentText.trim().length === 0;
-    
-    if (sendSuccess) {
-        console.log("✅ [runPrompt] Send successful - input cleared");
-    } else {
-        console.warn("⚠️ [runPrompt] Input not cleared, continuing anyway");
+    function setStatus(status) {
+        if (status === 'working') {
+            document.body.style.borderTop = "5px solid orange";
+        } else if (status === 'success') {
+            document.body.style.borderTop = "5px solid green";
+            setTimeout(() => document.body.style.borderTop = "none", 2000);
+        } else if (status === 'error') {
+            document.body.style.borderTop = "5px solid red";
+            setTimeout(() => document.body.style.borderTop = "none", 3000);
+        } else {
+            document.body.style.borderTop = "none";
+        }
     }
 
-    // 5. 等待响应
-    console.log("⏳ [runPrompt] Starting to wait for response...");
-    waitForResponse(id, text);
-}
+    function sleep(ms) {
+        return new Promise(resolve => setTimeout(resolve, ms));
+    }
 
-function waitForResponse(id, userPrompt = "") {
-    console.log("⏳ [waitForResponse] Starting to wait for response, ID:", id);
-    
-    const getPageText = () => {
-        const main = document.querySelector('main');
-        return main ? main.innerText : document.body.innerText;
-    };
-    
-    const initialText = getPageText();
-    const initialLength = initialText.length;
-    console.log(`📊 [waitForResponse] Initial text length: ${initialLength}`);
-    
-    let lastText = initialText;
-    let lastLength = initialLength;
-    let stableCount = 0;
-    const maxStable = 3;
-    const checkInterval = 800;
-    let checkCount = 0;
-    let hasDetectedGrowth = false;
-    let lastGrowthTime = Date.now();
-    
-    const checkLoop = setInterval(() => {
-        checkCount++;
-        const currentText = getPageText();
-        const currentLength = currentText.length;
-        
-        // 检测"Stop responding"按钮
-        const stopBtn = Array.from(document.querySelectorAll('button, [role="button"]')).find(btn => {
-            const text = btn.innerText || btn.textContent || "";
-            return text.includes("Stop responding") || text.includes("停止响应");
-        });
-        const isGenerating = !!stopBtn;
-        
-        // 检测输入框是否可用
-        const inputArea = document.querySelector('div[contenteditable="true"], rich-textarea div p, textarea, [role="textbox"]');
-        const isInputReady = inputArea && !inputArea.hasAttribute('disabled') && inputArea.offsetParent !== null;
-        
-        // 获取响应文本
-        let responseText = "";
-        const modelResponses = document.querySelectorAll('model-response.ng-star-inserted');
-        if (modelResponses.length > 0) {
-            const lastModelResponse = modelResponses[modelResponses.length - 1];
-            const messageContent = lastModelResponse.querySelector('message-content .markdown, .markdown-main-panel, [id^="message-content-id"]');
-            if (messageContent) {
-                responseText = messageContent.innerText || messageContent.textContent || "";
+    async function waitForElement(selectors, timeout = 5000) {
+        const start = Date.now();
+        while (Date.now() - start < timeout) {
+            for (const sel of selectors) {
+                const el = document.querySelector(sel);
+                if (el) return el;
             }
+            await sleep(100);
         }
-        
-        if (!responseText) {
-            const messageContents = document.querySelectorAll('message-content');
-            if (messageContents.length > 0) {
-                const lastMessage = messageContents[messageContents.length - 1];
-                const markdown = lastMessage.querySelector('.markdown');
-                if (markdown) {
-                    responseText = markdown.innerText || markdown.textContent || "";
-                }
-            }
-        }
+        throw new Error("Element not found: " + selectors.join(", "));
+    }
 
-        console.log(`🔍 [waitForResponse] Check #${checkCount}: Length=${currentLength}, ResponseText=${responseText.length}, Stable=${stableCount}/${maxStable}, Generating=${isGenerating}`);
-
-        if (currentLength > lastLength) {
-            console.log(`📈 [waitForResponse] Text growing: ${lastLength} -> ${currentLength}`);
-            lastText = currentText;
-            lastLength = currentLength;
-            stableCount = 0;
-            hasDetectedGrowth = true;
-            lastGrowthTime = Date.now();
-        } else if (currentLength === lastLength && currentLength > initialLength) {
-            if (!isGenerating) {
-                stableCount++;
-                console.log(`📊 [waitForResponse] Text stable (${stableCount}/${maxStable}): ${currentLength} chars`);
-            } else {
-                console.log(`⏸️ [waitForResponse] Still generating, resetting stability`);
-                stableCount = 0;
-            }
-        }
-
-        const isComplete = (
-            (stableCount >= maxStable && hasDetectedGrowth && currentLength > initialLength && !isGenerating) ||
-            (isInputReady && hasDetectedGrowth && currentLength > initialLength && stableCount >= 2 && !isGenerating) ||
-            (responseText && responseText.length > 0 && stableCount >= 2 && !isGenerating)
-        );
-
-        if (isComplete) {
-            clearInterval(checkLoop);
-            console.log("✅ [waitForResponse] Response captured! Length:", currentLength);
-            setStatus('success');
-            
-            let finalText = "";
-            
-            if (responseText && responseText.length > 0) {
-                finalText = responseText;
-                console.log("📝 [waitForResponse] Using responseText, length:", finalText.length);
-            } else {
-                const chatMessages = document.querySelectorAll('[class*="message"], [data-message-id]');
-                if (chatMessages.length > 0) {
-                    for (let i = chatMessages.length - 1; i >= 0; i--) {
-                        const msg = chatMessages[i];
-                        const msgText = msg.innerText || msg.textContent || "";
-                        if (msgText.length > 0 && 
-                            !msgText.includes("Expand menu") && 
-                            !msgText.includes("New chat") &&
-                            !msgText.includes("Use microphone") &&
-                            !msgText.includes("Settings & help") &&
-                            !msgText.includes("Add files") &&
-                            msgText !== userPrompt) {
-                            finalText = msgText;
-                            console.log("📝 [waitForResponse] Found message from chat area");
-                            break;
-                        }
-                    }
-                }
-                
-                if (!finalText || finalText.length < 10) {
-                    finalText = currentText.substring(initialLength)
-                        .replace(/Expand menu.*?New chat/gi, '')
-                        .replace(/Use microphone.*?Gemini/gi, '')
-                        .replace(/Settings & help.*/gi, '')
-                        .replace(/Add files.*/gi, '')
-                        .trim();
-                }
-            }
-            
-            chrome.runtime.sendMessage({
-                type: 'GEMINI_RESPONSE',
-                id: id,
-                content: finalText.trim() || "Response received but content extraction failed"
-            }).catch(err => {
-                console.error("❌ [waitForResponse] Failed to send response:", err);
-            });
-        }
-    }, checkInterval);
-    
-    // 120秒硬超时
-    setTimeout(() => {
-        clearInterval(checkLoop);
-        console.warn(`⏱️ [waitForResponse] Timeout after 120s`);
-        
-        if (stableCount < maxStable) {
-            if (hasDetectedGrowth && lastLength > initialLength) {
-                console.log("🔄 [waitForResponse] Returning partial response");
-                
-                let partialText = "";
-                const modelResponses = document.querySelectorAll('model-response.ng-star-inserted');
-                if (modelResponses.length > 0) {
-                    const lastModelResponse = modelResponses[modelResponses.length - 1];
-                    const messageContent = lastModelResponse.querySelector('message-content .markdown, .markdown-main-panel');
-                    if (messageContent) {
-                        partialText = messageContent.innerText || messageContent.textContent || "";
-                    }
-                }
-                
-                if (partialText && partialText.length > 0) {
-                    chrome.runtime.sendMessage({ 
-                        type: 'GEMINI_RESPONSE', 
-                        id: id, 
-                        content: partialText.trim()
-                    }).catch(err => console.error("❌ Failed to send partial response:", err));
-                } else {
-                    const diffText = lastText.substring(initialLength);
-                    chrome.runtime.sendMessage({ 
-                        type: 'GEMINI_RESPONSE', 
-                        id: id, 
-                        content: diffText.trim() || "Response partially captured"
-                    }).catch(err => console.error("❌ Failed to send diff response:", err));
-                }
-            } else {
-                chrome.runtime.sendMessage({ 
-                    type: 'GEMINI_RESPONSE', 
-                    id: id, 
-                    content: "Error: Timeout waiting for response" 
-                }).catch(err => console.error("❌ Failed to send timeout response:", err));
-            }
-        }
-    }, 120000);
-}
-
-})(); // 结束 IIFE
+    console.log(`✅ Instance ${currentInstanceId} Ready and Listening.`);
+})();
